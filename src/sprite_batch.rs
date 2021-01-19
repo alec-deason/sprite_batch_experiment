@@ -3,6 +3,7 @@ use bevy::{
     prelude::*,
     reflect::TypeUuid,
     core::FloatOrd,
+    sprite::QUAD_HANDLE,
     render::{
         camera::{VisibleEntities, VisibleEntity},
         stage::DRAW,
@@ -32,7 +33,6 @@ impl Plugin for BatchingPlugin {
             .add_stage_after(stage::UPDATE, "update_batches", SystemStage::parallel())
             .add_system_to_stage("update_batches", update_batches.system())
             .add_stage_before(DRAW, "pre_draw", SystemStage::parallel())
-            .add_system_to_stage("pre_draw", inject_visibles.system())
             .add_system_to_stage("pre_draw", batch_system.system())
         ;
 
@@ -40,10 +40,6 @@ impl Plugin for BatchingPlugin {
         let mut render_graph = resources.get_mut::<RenderGraph>().unwrap();
         render_graph.add_batched_sprite_graph(resources);
         let mut meshes = resources.get_mut::<Assets<Mesh>>().unwrap();
-        meshes.set_untracked(
-             BATCH_QUAD_HANDLE,
-             Mesh::from(shape::Quad::new(Vec2::new(1.0, 1.0))),
-         )
     }
 }
 
@@ -60,8 +56,8 @@ impl Default for BatchedDraw {
 
 #[derive(Bundle)]
 pub struct BatchedSpriteBundle {
-    pub sprite: Sprite,
-    pub material: Handle<ColorMaterial>,
+    pub sprite: TextureAtlasSprite,
+    pub atlas: Handle<TextureAtlas>,
     pub main_pass: MainPass,
     pub batched_draw: BatchedDraw,
     pub visible: Visible,
@@ -70,21 +66,21 @@ pub struct BatchedSpriteBundle {
     pub global_transform: GlobalTransform,
 }
 
- pub const BATCH_QUAD_HANDLE: HandleUntyped =
-      HandleUntyped::weak_from_u64(Mesh::TYPE_UUID, 14163428733613768514);
-
 impl BatchedSpriteBundle {
-    pub fn new(material: Handle<ColorMaterial>, transform: Transform) -> Self {
+    pub fn new(atlas: Handle<TextureAtlas>, atlas_index: u32, transform: Transform) -> Self {
          Self {
              visible: Visible {
-                 is_transparent: true,
+                 is_transparent: false,
                  ..Default::default()
              },
              main_pass: MainPass,
              batched_draw: Default::default(),
-             sprite: Default::default(),
-             material,
+             atlas,
              transform,
+             sprite: TextureAtlasSprite {
+                 color: Color::default(),
+                 index: atlas_index,
+             },
              global_transform: Default::default(),
          }
     }
@@ -92,10 +88,10 @@ impl BatchedSpriteBundle {
 
 struct SpriteBatch<'a> {
     render_resource_bindings: &'a mut RenderResourceBindings,
+    atlas: &'a Handle<TextureAtlas>,
     mesh: &'a Handle<Mesh>,
-    count: usize,
     vertex_buffer_descriptor: VertexBufferDescriptor,
-    transforms: &'a [GlobalTransform]
+    instance_data: &'a [(GlobalTransform, TextureAtlasSprite)],
 }
 
 impl<'a> Drawable for SpriteBatch<'a> {
@@ -117,7 +113,6 @@ impl<'a> Drawable for SpriteBatch<'a> {
                  mesh::VERTEX_ATTRIBUTE_BUFFER_ID,
              )
          {
-             println!("setting buffer: {:?}", vertex_attribute_buffer_id);
              draw.set_vertex_buffer(0, vertex_attribute_buffer_id, 0);
          } else {
              println!("Could not find vertex buffer for batch mesh.")
@@ -138,17 +133,30 @@ impl<'a> Drawable for SpriteBatch<'a> {
          }
 
          context.set_bind_groups_from_bindings(draw, &mut [self.render_resource_bindings])?;
+         context.set_asset_bind_groups(draw, self.atlas).unwrap();
 
-        let transforms:Vec<_> = self.transforms.iter().map(|t| t.compute_matrix().to_cols_array()).collect();
+        let mut transforms:Vec<_> = self.instance_data.iter().map(|(t, _)| t.compute_matrix().to_cols_array()).collect();
+        transforms.extend((0..200-transforms.len()).map(|_| [0.0f32; 16]));
         let transforms_buffer = context.get_uniform_buffer(&transforms).unwrap();
-         let transforms_bind_group = BindGroup::build()
+        let mut colors:Vec<_> = self.instance_data.iter().map(|(_, s)| [s.color.r(), s.color.g(), s.color.b(), s.color.a()]).collect();
+        colors.extend((0..200-colors.len()).map(|_| [0.0; 4]));
+        let colors_buffer = context.get_uniform_buffer(&colors).unwrap();
+        let mut atlas_indexes:Vec<_> = self.instance_data.iter().map(|(_, s)| [s.index, 0, 0, 0]).collect();
+        atlas_indexes.extend((0..200-atlas_indexes.len()).map(|_| [0u32; 4]));
+        assert_eq!(transforms.len(), 200);
+        assert_eq!(colors.len(), 200);
+        assert_eq!(atlas_indexes.len(), 200);
+        let atlas_indexes_buffer = context.get_uniform_buffer(&atlas_indexes).unwrap();
+         let instance_data_bind_group = BindGroup::build()
             .add_binding(0, transforms_buffer)
+            .add_binding(1, colors_buffer)
+            .add_binding(2, atlas_indexes_buffer)
             .finish();
-        context.create_bind_group_resource(3, &transforms_bind_group)?;
-        draw.set_bind_group(3, &transforms_bind_group);
+        context.create_bind_group_resource(2, &instance_data_bind_group)?;
+        draw.set_bind_group(2, &instance_data_bind_group);
 
 
-         draw.draw_indexed(indices.clone(), 0, 0..self.count as u32);
+         draw.draw_indexed(indices.clone(), 0, 0..self.instance_data.len() as u32);
          Ok(())
     }
 }
@@ -212,17 +220,6 @@ pub mod node {
 
  impl BatchedSpriteRenderGraphBuilder for RenderGraph {
      fn add_batched_sprite_graph(&mut self, resources: &Resources) -> &mut Self {
-         self.add_system_node(
-             node::COLOR_MATERIAL,
-             AssetRenderResourcesNode::<ColorMaterial>::new(false),
-         );
-         self.add_node_edge(node::COLOR_MATERIAL, base::node::MAIN_PASS)
-             .unwrap();
-
-         self.add_system_node(node::SPRITE, RenderResourcesNode::<Sprite>::new(true));
-         self.add_node_edge(node::SPRITE, base::node::MAIN_PASS)
-             .unwrap();
-
          let mut pipelines = resources.get_mut::<Assets<PipelineDescriptor>>().unwrap();
          let mut shaders = resources.get_mut::<Assets<Shader>>().unwrap();
          pipelines.set_untracked(BATCHED_SPRITE_PIPELINE_HANDLE, build_batched_sprite_pipeline(&mut shaders));
@@ -235,45 +232,27 @@ struct Batch;
 fn update_batches(
     commands: &mut Commands,
     mut batches: Query<Entity, With<Batch>>,
-    query: Query<(&Sprite, &Handle<ColorMaterial>, &BatchedDraw)>,
+    query: Query<(&Handle<TextureAtlas>, &GlobalTransform, &BatchedDraw), With<TextureAtlasSprite>>,
 ) {
     let mut draws:Vec<_> = batches.iter_mut().collect();
-    let mut batches = HashSet::new();
-    for (sprite, material, draw) in query.iter() {
+    let mut batches = HashMap::new();
+    for (atlas, t, draw) in query.iter() {
         if draw.is_visible {
-            batches.insert(((sprite.size.x as i32, sprite.size.y as i32), material));
+            *batches.entry((atlas, (t.translation.z * 100.0) as i32)).or_insert(0) += 1;
         }
     }
-    if draws.len() < batches.len() {
-        for _ in 0..batches.len()-draws.len() {
-            draws.push(commands.spawn((Draw::default(), Batch, RenderPipelines::from_pipelines(vec![RenderPipeline::new(BATCHED_SPRITE_PIPELINE_HANDLE.typed(),)]), MainPass)).current_entity().unwrap());
+    let mut count = 0;
+    for c in batches.values() {
+        count += c/200 + 1;
+    }
+
+    if draws.len() < count {
+        for _ in 0..count-draws.len() {
+            draws.push(commands.spawn((Draw::default(), Batch, MainPass)).current_entity().unwrap());
         }
-    } else if draws.len() > batches.len() {
-        for e in draws.drain(0..draws.len()-batches.len()) {
+    } else if draws.len() > count {
+        for e in draws.drain(0..draws.len()-count) {
             commands.despawn(e);
-        }
-    }
-    draws.sort();
-    let mut batches:Vec<_> = batches.into_iter().collect();
-    batches.sort();
-    for (e, (sprite, material)) in draws.into_iter().zip(batches.into_iter()) {
-        let sprite:Sprite = Sprite {
-            size: Vec2::new(sprite.0 as f32, sprite.1 as f32),
-            ..Default::default()
-        };
-        let material: Handle<ColorMaterial> = material.clone_weak();
-        commands.insert(e, (sprite, material));
-    }
-
-}
-
-fn inject_visibles(
-    mut cameras: Query<&mut VisibleEntities>,
-    batches: Query<Entity, With<Batch>>,
-) {
-    if let Some(mut visible) = cameras.iter_mut().next() {
-        for entity in batches.iter() {
-            visible.value.push(VisibleEntity { entity, order: FloatOrd(0.0) });
         }
     }
 }
@@ -283,33 +262,37 @@ fn batch_system(
     mut render_resource_bindings: ResMut<RenderResourceBindings>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut batches: Query<(Entity, &mut Draw), With<Batch>>,
-    query: Query<(&Sprite, &Handle<ColorMaterial>, &GlobalTransform, &BatchedDraw)>,
+    mut cameras: Query<(&mut VisibleEntities, &GlobalTransform)>,
+    query: Query<(&TextureAtlasSprite, &Handle<TextureAtlas>, &GlobalTransform, &BatchedDraw)>,
 ) {
-    println!("{:#?}", *render_resource_bindings);
     let mut draws:Vec<_> = batches.iter_mut().collect();
     let mut batches = HashMap::new();
-    for (sprite, material, transform, draw) in query.iter() {
+    for (sprite, atlas, transform, draw) in query.iter() {
         if draw.is_visible {
-            batches.entry(((sprite.size.x as i32, sprite.size.y as i32), material)).or_insert_with(|| vec![]).push(*transform);
+            batches.entry((atlas, 0)).or_insert_with(|| vec![]).push((*transform, sprite.clone()));
         }
     }
-    println!("{:?}", draws.iter().map(|(e, _)| e));
-    draws.sort_by_key(|(e, _)| *e);
-    let mut batches:Vec<_> = batches.into_iter().collect();
-    batches.sort_by_key(|(k, _)| *k);
 
-    if let Some(mesh) = meshes.get_mut(BATCH_QUAD_HANDLE) {
-        for ((_key, transforms), (_e, mut draw)) in batches.into_iter().zip(draws.into_iter()) {
-            let mut batch = SpriteBatch {
-                render_resource_bindings: &mut render_resource_bindings,
-                mesh: &BATCH_QUAD_HANDLE.typed(),
-                count: transforms.len(),
-                vertex_buffer_descriptor: mesh.get_vertex_buffer_descriptor(),
-                transforms: &transforms,
-            };
-            println!("batch size: {}", batch.count);
+    let mut total = 0;
+    if let Some((mut visible, camera_transform)) = cameras.iter_mut().next() {
+        if let Some(mesh) = meshes.get_mut(QUAD_HANDLE) {
+            for ((atlas, z), instance_data) in batches.into_iter() {
+                for instance_data in instance_data.chunks(200) {
+                    total += instance_data.len();
+                    if let Some((entity, mut draw)) = draws.pop() {
+                        visible.value.push(VisibleEntity { entity, order: FloatOrd(camera_transform.translation.z - z as f32/100.0) });
+                        let mut batch = SpriteBatch {
+                            atlas,
+                            render_resource_bindings: &mut render_resource_bindings,
+                            mesh: &QUAD_HANDLE.typed(),
+                            vertex_buffer_descriptor: mesh.get_vertex_buffer_descriptor(),
+                            instance_data,
+                        };
 
-            batch.draw(&mut draw, &mut context).unwrap();
+                        batch.draw(&mut draw, &mut context).unwrap();
+                    }
+                }
+            }
         }
     }
 }
