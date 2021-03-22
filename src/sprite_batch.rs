@@ -12,7 +12,7 @@ use bevy::{
             PipelineSpecialization, PrimitiveState, StencilFaceState, StencilState,
             VertexBufferLayout,
         },
-        render_graph::{base::MainPass, RenderGraph},
+        render_graph::base::MainPass,
         renderer::{BindGroup, RenderResourceBindings, RenderResourceId},
         shader::{Shader, ShaderStage, ShaderStages},
         texture::TextureFormat,
@@ -33,8 +33,6 @@ impl Plugin for BatchingPlugin {
             .add_stage_before(RenderStage::Draw, "pre_draw", SystemStage::parallel())
             .add_system_to_stage("pre_draw", batch_system.system());
 
-        //let mut render_graph = app.world_mut().cell().get_resource_mut::<RenderGraph>().unwrap();
-        //render_graph.add_batched_sprite_graph(app.world_mut());
         add_sprite_batch_graph(app.world_mut());
     }
 
@@ -220,27 +218,9 @@ pub fn build_batched_sprite_pipeline(shaders: &mut Assets<Shader>) -> PipelineDe
         })
     }
 }
-/*
-pub trait BatchedSpriteRenderGraphBuilder {
-    fn add_batched_sprite_graph(&mut self, world: &mut World) -> &mut Self;
-}
 
-impl BatchedSpriteRenderGraphBuilder for RenderGraph {
-    fn add_batched_sprite_graph(&mut self, world: &mut World) -> &mut Self {
-        let world = world.cell();
-        let mut pipelines = world.get_resource_mut::<Assets<PipelineDescriptor>>().unwrap();
-        let mut shaders = world.get_resource_mut::<Assets<Shader>>().unwrap();
-        pipelines.set_untracked(
-            BATCHED_SPRITE_PIPELINE_HANDLE,
-            build_batched_sprite_pipeline(&mut shaders),
-        );
-        self
-    }
-}
-*/
 pub(crate) fn add_sprite_batch_graph(world: &mut World) {
     let world = world.cell();
-    //let mut render_graph = world.get_resource_mut::<RenderGraph>().unwrap();
     let mut pipelines = world
         .get_resource_mut::<Assets<PipelineDescriptor>>()
         .unwrap();
