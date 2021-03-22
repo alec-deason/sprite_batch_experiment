@@ -7,16 +7,18 @@ use bevy::{
         draw::{DrawContext, DrawError, Drawable},
         mesh,
         pipeline::{
-            BlendFactor, BlendOperation, BlendState, ColorTargetState, ColorWrite, CompareFunction,
-            CullMode, DepthBiasState, DepthStencilState, FrontFace, PipelineDescriptor,
-            PipelineSpecialization, PrimitiveState, StencilFaceState, StencilState,
-            VertexBufferLayout,
+            BlendDescriptor, BlendFactor, BlendOperation, ColorStateDescriptor, ColorWrite,
+            CompareFunction, CullMode, DepthStencilStateDescriptor, FrontFace, PipelineDescriptor,
+            PipelineSpecialization, RasterizationStateDescriptor,
+            StencilStateDescriptor, StencilStateFaceDescriptor, VertexBufferDescriptor,
         },
-        render_graph::base::MainPass,
+        render_graph::{
+            base::MainPass, RenderGraph,
+        },
         renderer::{BindGroup, RenderResourceBindings, RenderResourceId},
         shader::{Shader, ShaderStage, ShaderStages},
+        stage::DRAW,
         texture::TextureFormat,
-        RenderStage,
     },
     sprite::QUAD_HANDLE,
 };
@@ -28,16 +30,14 @@ pub const BATCHED_SPRITE_PIPELINE_HANDLE: HandleUntyped =
 pub struct BatchingPlugin;
 impl Plugin for BatchingPlugin {
     fn build(&self, app: &mut AppBuilder) {
-        app.add_stage_after(CoreStage::Update, "update_batches", SystemStage::parallel())
+        app.add_stage_after(stage::UPDATE, "update_batches", SystemStage::parallel())
             .add_system_to_stage("update_batches", update_batches.system())
-            .add_stage_before(RenderStage::Draw, "pre_draw", SystemStage::parallel())
+            .add_stage_before(DRAW, "pre_draw", SystemStage::parallel())
             .add_system_to_stage("pre_draw", batch_system.system());
 
-        add_sprite_batch_graph(app.world_mut());
-    }
-
-    fn name(&self) -> &str {
-        std::any::type_name::<Self>()
+        let resources = app.resources_mut();
+        let mut render_graph = resources.get_mut::<RenderGraph>().unwrap();
+        render_graph.add_batched_sprite_graph(resources);
     }
 }
 
@@ -76,8 +76,6 @@ impl BatchedSpriteBundle {
             sprite: TextureAtlasSprite {
                 color: Color::default(),
                 index: atlas_index,
-                flip_x: false,
-                flip_y: false,
             },
             global_transform: Default::default(),
         }
@@ -88,7 +86,7 @@ struct SpriteBatch<'a> {
     render_resource_bindings: &'a mut RenderResourceBindings,
     atlas: &'a Handle<TextureAtlas>,
     mesh: &'a Handle<Mesh>,
-    vertex_buffer_layout: VertexBufferLayout,
+    vertex_buffer_descriptor: VertexBufferDescriptor,
     instance_data: &'a [(GlobalTransform, TextureAtlasSprite)],
 }
 
@@ -98,7 +96,7 @@ impl<'a> Drawable for SpriteBatch<'a> {
             draw,
             &BATCHED_SPRITE_PIPELINE_HANDLE.typed(),
             &PipelineSpecialization {
-                vertex_buffer_layout: self.vertex_buffer_layout.clone(),
+                vertex_buffer_descriptor: self.vertex_buffer_descriptor.clone(),
                 ..Default::default()
             },
         )?;
@@ -116,11 +114,7 @@ impl<'a> Drawable for SpriteBatch<'a> {
         if let Some(RenderResourceId::Buffer(quad_index_buffer)) =
             render_resource_context.get_asset_resource(self.mesh, mesh::INDEX_BUFFER_ASSET_INDEX)
         {
-            draw.set_index_buffer(
-                quad_index_buffer,
-                0,
-                bevy::render::pipeline::IndexFormat::Uint32,
-            );
+            draw.set_index_buffer(quad_index_buffer, 0);
             if let Some(buffer_info) = render_resource_context.get_buffer_info(quad_index_buffer) {
                 indices = 0..(buffer_info.size / 4) as u32;
             } else {
@@ -170,36 +164,33 @@ impl<'a> Drawable for SpriteBatch<'a> {
 
 pub fn build_batched_sprite_pipeline(shaders: &mut Assets<Shader>) -> PipelineDescriptor {
     PipelineDescriptor {
-        depth_stencil: Some(DepthStencilState {
+        rasterization_state: Some(RasterizationStateDescriptor {
+            front_face: FrontFace::Ccw,
+            cull_mode: CullMode::None,
+            depth_bias: 0,
+            depth_bias_slope_scale: 0.0,
+            depth_bias_clamp: 0.0,
+            clamp_depth: false,
+        }),
+        depth_stencil_state: Some(DepthStencilStateDescriptor {
             format: TextureFormat::Depth32Float,
             depth_write_enabled: true,
             depth_compare: CompareFunction::LessEqual,
-            stencil: StencilState {
-                front: StencilFaceState::IGNORE,
-                back: StencilFaceState::IGNORE,
+            stencil: StencilStateDescriptor {
+                front: StencilStateFaceDescriptor::IGNORE,
+                back: StencilStateFaceDescriptor::IGNORE,
                 read_mask: 0,
                 write_mask: 0,
             },
-            bias: DepthBiasState {
-                constant: 0,
-                slope_scale: 0.0,
-                clamp: 0.0,
-            },
-            clamp_depth: false,
         }),
-        primitive: PrimitiveState {
-            front_face: FrontFace::Ccw,
-            cull_mode: CullMode::None,
-            ..Default::default()
-        },
-        color_target_states: vec![ColorTargetState {
+        color_states: vec![ColorStateDescriptor {
             format: TextureFormat::default(),
-            color_blend: BlendState {
+            color_blend: BlendDescriptor {
                 src_factor: BlendFactor::SrcAlpha,
                 dst_factor: BlendFactor::OneMinusSrcAlpha,
                 operation: BlendOperation::Add,
             },
-            alpha_blend: BlendState {
+            alpha_blend: BlendDescriptor {
                 src_factor: BlendFactor::One,
                 dst_factor: BlendFactor::One,
                 operation: BlendOperation::Add,
@@ -219,21 +210,26 @@ pub fn build_batched_sprite_pipeline(shaders: &mut Assets<Shader>) -> PipelineDe
     }
 }
 
-pub(crate) fn add_sprite_batch_graph(world: &mut World) {
-    let world = world.cell();
-    let mut pipelines = world
-        .get_resource_mut::<Assets<PipelineDescriptor>>()
-        .unwrap();
-    let mut shaders = world.get_resource_mut::<Assets<Shader>>().unwrap();
-    pipelines.set_untracked(
-        BATCHED_SPRITE_PIPELINE_HANDLE,
-        build_batched_sprite_pipeline(&mut shaders),
-    );
+pub trait BatchedSpriteRenderGraphBuilder {
+    fn add_batched_sprite_graph(&mut self, resources: &Resources) -> &mut Self;
 }
+
+impl BatchedSpriteRenderGraphBuilder for RenderGraph {
+    fn add_batched_sprite_graph(&mut self, resources: &Resources) -> &mut Self {
+        let mut pipelines = resources.get_mut::<Assets<PipelineDescriptor>>().unwrap();
+        let mut shaders = resources.get_mut::<Assets<Shader>>().unwrap();
+        pipelines.set_untracked(
+            BATCHED_SPRITE_PIPELINE_HANDLE,
+            build_batched_sprite_pipeline(&mut shaders),
+        );
+        self
+    }
+}
+
 struct Batch;
 
 fn update_batches(
-    mut commands: Commands,
+    commands: &mut Commands,
     mut batches: Query<Entity, With<Batch>>,
     query: Query<(&Handle<TextureAtlas>, &GlobalTransform, &BatchedDraw), With<TextureAtlasSprite>>,
 ) {
@@ -304,9 +300,10 @@ fn batch_system(
                             atlas,
                             render_resource_bindings: &mut render_resource_bindings,
                             mesh: &QUAD_HANDLE.typed(),
-                            vertex_buffer_layout: mesh.get_vertex_buffer_layout(),
+                            vertex_buffer_descriptor: mesh.get_vertex_buffer_descriptor(),
                             instance_data,
                         };
+
                         batch.draw(&mut draw, &mut context).unwrap();
                     }
                 }
